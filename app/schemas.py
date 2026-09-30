@@ -31,6 +31,20 @@ class CreateGroupRequest(BaseModel):
         return devices
 
 
+class TransferDevicesRequest(BaseModel):
+    # 从来源组调到目标组的设备 ID；设备随当前版本一起移动，故只给 ID。
+    # 列表非空、组内设备 ID 互不重复由模型层保证。
+    device_ids: list[DeviceId] = Field(min_length=1, max_length=8)
+    target_group_id: DeviceId
+
+    @field_validator("device_ids")
+    @classmethod
+    def _unique_device_ids(cls, device_ids: list[str]) -> list[str]:
+        if len(set(device_ids)) != len(device_ids):
+            raise ValueError("调配设备 ID 不能重复")
+        return device_ids
+
+
 class BatchTarget(BaseModel):
     device_id: DeviceId
     target_version: Version

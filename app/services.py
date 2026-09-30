@@ -14,6 +14,10 @@ from . import db
 RECEIPT_RESULTS = ("ready", "failed")
 TERMINAL_STATUS = ("effective", "failed")
 
+# 设备组成员数约束（与 schemas.CreateGroupRequest 保持一致）。
+MIN_GROUP_SIZE = 2
+MAX_GROUP_SIZE = 8
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -79,6 +83,139 @@ def get_group(group_id: str) -> dict[str, Any]:
         ]
     group["devices"] = devices
     return group
+
+
+def _group_devices(conn: sqlite3.Connection, group_id: str) -> list[dict[str, Any]]:
+    """在已有事务内读取组内设备（调配后返回两组新名单时复用同一写事务快照）。"""
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT device_id, current_version FROM devices"
+            " WHERE group_id = ? ORDER BY device_id",
+            (group_id,),
+        ).fetchall()
+    ]
+
+
+def transfer_devices(
+    source_group_id: str, target_group_id: str, device_ids: list[str]
+) -> dict[str, Any]:
+    """把来源组内的一批设备连当前版本整体调到目标组。
+
+    全部校验与移动在同一个 ``BEGIN IMMEDIATE`` 事务内完成，任一条件不满足即
+    抛异常回滚，数据一台都不动：
+      * 两组必须存在且互不相同；
+      * 每台设备都必须在来源组内（陌生设备 → 422）；
+      * 目标组不能已有同 ID 设备（设备 ID 全局唯一 → 422）；
+      * 调配后两组的成员数都必须落在 2～8 之间（→ 422）；
+      * 任一组存在未结束（open）批次 → 409。
+
+    并发语义：调配与开批、回执共用全局唯一写锁，事务内检查两组 open 批次，
+    因此三方的任何交错都等价于某个串行顺序。若开批先于调配，则该组存在
+    open 批次、调配被拒（旧名单的批次不会在新名单上结算）；若调配先于开批，
+    之后的批次只能按新名单创建。已结束批次的 group_id 与目标版本原样保留，
+    永远归原组、按旧名单查询与重放。
+    """
+    requested = sorted(set(device_ids))
+    with db.write_transaction() as conn:
+        _group_row(conn, source_group_id)  # 来源组不存在 → 404
+        _group_row(conn, target_group_id)  # 目标组不存在 → 404
+        if source_group_id == target_group_id:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "来源组与目标组必须是两个不同的设备组"},
+            )
+
+        source_devices = _group_devices(conn, source_group_id)
+        target_devices = _group_devices(conn, target_group_id)
+        source_ids = {d["device_id"] for d in source_devices}
+        target_ids = {d["device_id"] for d in target_devices}
+
+        unknown = sorted(set(requested) - source_ids)
+        conflicts = sorted(set(requested) & target_ids)
+
+        problems: dict[str, Any] = {}
+        if unknown:
+            problems["unknown_devices"] = unknown
+        if conflicts:
+            problems["target_conflict_devices"] = conflicts
+        if not problems:
+            new_source_size = len(source_ids) - len(requested)
+            new_target_size = len(target_ids) + len(requested)
+            if not (MIN_GROUP_SIZE <= new_source_size <= MAX_GROUP_SIZE):
+                problems["source_group"] = {
+                    "group_id": source_group_id,
+                    "size_after": new_source_size,
+                    "min": MIN_GROUP_SIZE,
+                    "max": MAX_GROUP_SIZE,
+                }
+            if not (MIN_GROUP_SIZE <= new_target_size <= MAX_GROUP_SIZE):
+                problems["target_group"] = {
+                    "group_id": target_group_id,
+                    "size_after": new_target_size,
+                    "min": MIN_GROUP_SIZE,
+                    "max": MAX_GROUP_SIZE,
+                }
+        if problems:
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "设备调配条件不满足，请求未改动任何数据", **problems},
+            )
+
+        # 任一组尚有未结束批次都拒绝。开批与本事务互斥（写锁 + open 部分唯一
+        # 索引），因此这里的检查不会与开批交错出"旧名单批次按新名单结算"。
+        for label, group_id in (
+            ("source_group_id", source_group_id),
+            ("target_group_id", target_group_id),
+        ):
+            open_batch = conn.execute(
+                "SELECT id FROM batches WHERE group_id = ? AND status = 'open'",
+                (group_id,),
+            ).fetchone()
+            if open_batch is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "任一组存在尚未结束的批次时不能调配设备",
+                        label: group_id,
+                        "open_batch_id": open_batch["id"],
+                    },
+                )
+
+        # 设备连同 current_version 一起移动：只改 group_id，版本与登记时间不动。
+        # 已结束批次的 batch_targets/receipts 不引用 devices 行，历史批次不受影响。
+        cur = conn.executemany(
+            "UPDATE devices SET group_id = ?"
+            " WHERE group_id = ? AND device_id = ?",
+            [
+                (target_group_id, source_group_id, device_id)
+                for device_id in requested
+            ],
+        )
+        if cur.rowcount != len(requested):
+            # 上面已逐台校验，理论上不可能；兜底防止任何静默少移动。
+            raise HTTPException(status_code=500, detail={"message": "调配行数与请求不一致"})
+
+        source_payload = dict(
+            conn.execute(
+                "SELECT id, name, created_at FROM device_groups WHERE id = ?",
+                (source_group_id,),
+            ).fetchone()
+        )
+        target_payload = dict(
+            conn.execute(
+                "SELECT id, name, created_at FROM device_groups WHERE id = ?",
+                (target_group_id,),
+            ).fetchone()
+        )
+        source_payload["devices"] = _group_devices(conn, source_group_id)
+        target_payload["devices"] = _group_devices(conn, target_group_id)
+
+    return {
+        "source_group": source_payload,
+        "target_group": target_payload,
+        "transferred_devices": requested,
+    }
 
 
 # --------------------------------------------------------------------------- #

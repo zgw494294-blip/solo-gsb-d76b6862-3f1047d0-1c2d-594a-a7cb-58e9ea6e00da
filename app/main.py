@@ -10,7 +10,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, status
 
 from . import db, services
-from .schemas import CreateBatchRequest, CreateGroupRequest, ReceiptRequest
+from .schemas import (
+    CreateBatchRequest,
+    CreateGroupRequest,
+    ReceiptRequest,
+    TransferDevicesRequest,
+)
 
 
 @asynccontextmanager
@@ -49,6 +54,18 @@ def list_groups() -> list[dict]:
 def get_group(group_id: str) -> dict:
     """查询设备组及其当前版本（每台设备一行）。"""
     return services.get_group(group_id)
+
+
+@app.post("/groups/{source_group_id}/transfers")
+def transfer_devices(
+    source_group_id: str, request: TransferDevicesRequest
+) -> dict:
+    """把来源组内一批设备连当前版本调到目标组，返回两组调配后的成员与版本。"""
+    return services.transfer_devices(
+        source_group_id=source_group_id,
+        target_group_id=request.target_group_id,
+        device_ids=request.device_ids,
+    )
 
 
 # ------------------------- 批次 ------------------------- #
