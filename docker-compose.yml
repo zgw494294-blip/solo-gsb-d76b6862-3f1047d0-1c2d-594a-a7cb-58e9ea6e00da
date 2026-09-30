@@ -1,0 +1,21 @@
+services:
+  firmware-release:
+    build: .
+    image: firmware-release-api:latest
+    container_name: firmware-release-api
+    ports:
+      # 宿主机端口:容器端口
+      - "8080:8080"
+    environment:
+      FIRMWARE_DB_PATH: /data/firmware_release.db
+    volumes:
+      - firmware-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  firmware-data:
