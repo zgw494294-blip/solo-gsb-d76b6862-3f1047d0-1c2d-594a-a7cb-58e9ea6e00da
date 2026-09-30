@@ -14,6 +14,10 @@ from . import db
 RECEIPT_RESULTS = ("ready", "failed")
 TERMINAL_STATUS = ("effective", "failed")
 
+# 设备组的成员数量边界（与登记时一致：2～8 台）。
+MIN_GROUP_DEVICES = 2
+MAX_GROUP_DEVICES = 8
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -66,19 +70,129 @@ def _group_row(conn: sqlite3.Connection, group_id: str) -> sqlite3.Row:
     return row
 
 
+def _group_payload(conn: sqlite3.Connection, group_id: str) -> dict[str, Any]:
+    """组装组详情（含每台设备当前版本）；调用方负责提供事务连接。"""
+    group = dict(_group_row(conn, group_id))
+    group["devices"] = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT device_id, current_version FROM devices"
+            " WHERE group_id = ? ORDER BY device_id",
+            (group_id,),
+        ).fetchall()
+    ]
+    return group
+
+
 def get_group(group_id: str) -> dict[str, Any]:
     with db.read_transaction() as conn:
-        group = dict(_group_row(conn, group_id))
-        devices = [
-            dict(r)
+        return _group_payload(conn, group_id)
+
+
+def transfer_devices(
+    source_group_id: str, target_group_id: str, device_ids: list[str]
+) -> dict[str, Any]:
+    """把一批设备连同当前版本从来源组调到目标组。
+
+    全部前置校验与行搬迁在同一个 ``BEGIN IMMEDIATE`` 写事务内完成，任何一条
+    不满足都整体回滚，数据保持原样：
+      * 两个组都必须存在（404）；
+      * 每台设备都必须在来源组内（422，``unknown_devices``）；
+      * 目标组不能已有同 ID 设备（409，``conflicting_devices``）；
+      * 调配后两组各自仍需保持 2～8 台（422）；
+      * 任一组存在未结束（open）批次时拒绝调配（409）。
+
+    写事务全局串行化，使调配与开批、回执必然按某个先后顺序完整生效：
+    开批/收尾在调配之前完成，旧名单批次就按旧名单结算（设备仍在原组，
+    ``WHERE group_id = 批次所属组`` 的版本切换照常命中）；调配先完成，则
+    随后的批次按新名单覆盖整组。
+    """
+    moving = sorted(set(device_ids))
+    with db.write_transaction() as conn:
+        _group_row(conn, source_group_id)  # 来源组不存在 → 404
+        _group_row(conn, target_group_id)  # 目标组不存在 → 404
+
+        source_devices = {
+            r["device_id"]: r
             for r in conn.execute(
-                "SELECT device_id, current_version FROM devices"
-                " WHERE group_id = ? ORDER BY device_id",
-                (group_id,),
+                "SELECT device_id, current_version, created_at FROM devices"
+                " WHERE group_id = ?",
+                (source_group_id,),
             ).fetchall()
-        ]
-    group["devices"] = devices
-    return group
+        }
+        target_devices = {
+            r["device_id"]
+            for r in conn.execute(
+                "SELECT device_id FROM devices WHERE group_id = ?",
+                (target_group_id,),
+            ).fetchall()
+        }
+
+        unknown = sorted(d for d in moving if d not in source_devices)
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "部分设备不在来源组内，整次调配不执行",
+                    "unknown_devices": unknown,
+                },
+            )
+
+        conflicts = sorted(d for d in moving if d in target_devices)
+        if conflicts:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "目标组已存在同 ID 设备，整次调配不执行",
+                    "conflicting_devices": conflicts,
+                },
+            )
+
+        source_after = len(source_devices) - len(moving)
+        target_after = len(target_devices) + len(moving)
+        if not (
+            MIN_GROUP_DEVICES <= source_after <= MAX_GROUP_DEVICES
+            and MIN_GROUP_DEVICES <= target_after <= MAX_GROUP_DEVICES
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "调配后两组都必须保持 2～8 台设备，整次调配不执行",
+                    "source_size_after": source_after,
+                    "target_size_after": target_after,
+                },
+            )
+
+        for gid in (source_group_id, target_group_id):
+            open_batch = conn.execute(
+                "SELECT id FROM batches WHERE group_id = ? AND status = 'open'",
+                (gid,),
+            ).fetchone()
+            if open_batch is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": f"设备组 {gid} 存在尚未结束的批次，不能调配设备",
+                        "group_id": gid,
+                        "open_batch_id": open_batch["id"],
+                    },
+                )
+
+        # 原子搬迁：连同当前版本与登记时间一起改挂到目标组。
+        # batch_targets / receipts 只按 batch_id + device_id 引用历史，
+        # 不被外键级联；已结束批次仍归原组、历史名单与回执原样保留。
+        conn.executemany(
+            "UPDATE devices SET group_id = ? WHERE group_id = ? AND device_id = ?",
+            [(target_group_id, source_group_id, d) for d in moving],
+        )
+
+        # 在提交前、同一事务内组装响应，保证返回的正是调配后的成员与版本。
+        result = {
+            "source_group": _group_payload(conn, source_group_id),
+            "target_group": _group_payload(conn, target_group_id),
+            "transferred_devices": moving,
+        }
+    return result
 
 
 # --------------------------------------------------------------------------- #

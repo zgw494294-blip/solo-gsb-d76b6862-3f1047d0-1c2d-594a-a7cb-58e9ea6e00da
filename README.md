@@ -16,8 +16,14 @@ Docker Compose 一条命令启动。
      `effective`。任何查询都不会读到"只切了一半"的中间状态。
 4. **批次结束后**：只接受已有回执的幂等重放；旧批次迟到的**新**回执被拒绝（`409`），
    不会影响旧批结论，也不会影响后续批次。
-5. **并发提交**：所有写操作走 `BEGIN IMMEDIATE` 事务，SQLite 写锁全局串行化，
-   并发结果必然等价于某个串行顺序。
+5. **设备组间调配**：指定两个不同的设备组与来源组内一批互不重复的设备 ID，
+   把这些设备**连同当前版本**整体调到目标组，返回调配后两组的成员与版本。
+   设备列表不能为空；只要有设备不在来源组、目标组已有同 ID，或调配后任一组
+   少于 2 台 / 多于 8 台，整次请求不改变任何数据。任一组存在未结束（`open`）
+   批次时也拒绝调配。已结束批次仍归原组，历史目标、回执查询与已有回执的
+   同结果重放都不受调配影响；调配后开的新批次按新名单覆盖整组。
+6. **并发提交**：所有写操作走 `BEGIN IMMEDIATE` 事务，SQLite 写锁全局串行化，
+   并发结果必然等价于某个串行顺序（包括调配与开批、回执并发的场景）。
 
 ## 快速启动
 
@@ -51,6 +57,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 | `POST` | `/groups` | 登记设备组（2～8 台，设备 ID 唯一） |
 | `GET` | `/groups` | 列出所有设备组 |
 | `GET` | `/groups/{group_id}` | 查询设备组及每台设备**当前版本** |
+| `POST` | `/groups/transfers` | 把一批设备连同当前版本从一个组调到另一个组 |
 | `POST` | `/groups/{group_id}/batches` | 为整组创建放行批次（逐台目标版本） |
 | `GET` | `/groups/{group_id}/batches` | 列出某组的全部批次 |
 | `GET` | `/batches/{batch_id}` | 查询批次状态、逐台目标版本与全部回执 |
@@ -182,6 +189,84 @@ curl -s http://localhost:8080/batches/$BID
 
 批次结束（`effective`/`failed`）后即可为该组开下一批；历史批次和回执永久保留可查。
 
+### 5. 在设备组之间调配设备
+
+先准备两个组：来源组 `line-a` 4 台，目标组 `line-b` 3 台（沿用上面的方式
+`POST /groups` 创建，把两个组 ID 分别存到 `SRC`、`DST`）。把 `dev-2`、`dev-4`
+连同它们的当前版本从 `line-a` 调到 `line-b`：
+
+```bash
+curl -s -X POST http://localhost:8080/groups/transfers \
+  -H 'Content-Type: application/json' \
+  -d "{
+        \"source_group_id\": \"$SRC\",
+        \"target_group_id\": \"$DST\",
+        \"device_ids\": [\"dev-2\", \"dev-4\"]
+      }"
+```
+
+返回（`200`）两组调配后的完整成员与版本（设备版本跟着设备走，例如 `dev-2`
+此前已升到 `2.0.0`，进目标组后仍是 `2.0.0`）：
+
+```json
+{
+  "source_group": {
+    "id": "grp_...a", "name": "line-a", "created_at": "...",
+    "devices": [
+      {"device_id": "dev-1", "current_version": "2.0.0"},
+      {"device_id": "dev-3", "current_version": "2.0.0"}
+    ]
+  },
+  "target_group": {
+    "id": "grp_...b", "name": "line-b", "created_at": "...",
+    "devices": [
+      {"device_id": "dev-2", "current_version": "2.0.0"},
+      {"device_id": "dev-4", "current_version": "2.0.0"},
+      {"device_id": "dev-5", "current_version": "1.0.0"},
+      {"device_id": "dev-6", "current_version": "1.0.0"},
+      {"device_id": "dev-7", "current_version": "1.0.0"}
+    ]
+  },
+  "transferred_devices": ["dev-2", "dev-4"]
+}
+```
+
+调配规则与状态码（任一不满足，整次请求回滚，数据一台都不变）：
+
+| 情况 | 状态码 |
+|---|---|
+| 调配成功 | `200` |
+| `device_ids` 为空 / 含重复 ID / 两组相同 | `422`（请求模型校验） |
+| 来源组或目标组不存在 | `404` |
+| 有设备不在来源组（`unknown_devices`） | `422` |
+| 调配后任一组少于 2 台或多于 8 台（返回 `source_size_after`、`target_size_after`） | `422` |
+| 目标组已有同 ID 设备（`conflicting_devices`） | `409` |
+| 任一组存在未结束批次（返回该组 `group_id`、`open_batch_id`） | `409` |
+
+与历史批次、后续批次的关系：
+
+- **已结束批次仍归原组**：批次记录、逐台目标版本与回执都按原样保留，
+  `GET /groups/{原组}/batches`、`GET /batches/{batch_id}` 照常查询；
+  对旧批**已有回执**的同结果重放仍返回 `200, replayed: true`，与调配无关。
+- **调配后开的新批次按新名单覆盖整组**：上例中再给 `line-b` 开批时，
+  目标必须逐台覆盖 `dev-2/dev-4/dev-5/dev-6/dev-7` 这 5 台，缺一台或多一台
+  都会被拒绝；给 `line-a` 开批则只覆盖 `dev-1/dev-3`。
+
+```bash
+# 调配后给目标组开批：按新名单 5 台逐台指定目标版本
+curl -s -X POST http://localhost:8080/groups/$DST/batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "targets": [
+          {"device_id": "dev-2", "target_version": "3.0.0"},
+          {"device_id": "dev-4", "target_version": "3.0.0"},
+          {"device_id": "dev-5", "target_version": "3.0.0"},
+          {"device_id": "dev-6", "target_version": "3.0.0"},
+          {"device_id": "dev-7", "target_version": "3.0.0"}
+        ]
+      }'
+```
+
 ## 并发正确性说明
 
 - SQLite 开启 **WAL**；所有写路径使用 `BEGIN IMMEDIATE`，进入事务即拿写锁，
@@ -191,6 +276,14 @@ curl -s http://localhost:8080/batches/$BID
   - 全 ready 时的"逐台切换 + 批次生效"对外是一个原子动作，不存在部分切换；
   - 出现 failed 时根本不会执行版本更新；
   - 任意并发交错的最终状态，都等价于把各回执按某个顺序串行执行的结果。
+- 设备调配同样在**单个写事务**内完成"两组 open 批次检查 → 成员/数量/重名校验
+  → 设备改挂目标组 → 组装两组响应"。因此调配与开批、回执并发时，只可能按
+  某个先后顺序**完整**生效：
+  - 开批 / 结算先于调配：批次按**旧名单**完整结算（版本切换按批次当时的组成员
+    命中），之后调配要么带着切换后的版本成功，要么因其他校验失败而整体回滚；
+  - 调配对先拿到写锁时，只要任一组仍有 `open` 批次，调配对立即 `409` 回滚——
+    旧名单批次随后仍按旧名单（成员未变）结算。**不会出现旧名单创建的批次按
+    新名单结算**。
 - 查询使用只读快照事务（`BEGIN`），同一请求内读到的版本与批次状态自洽一致。
 - 数据库层还有一道兜底：`batches` 上 `status='open'` 的部分唯一索引，
   保证即使应用层竞争，同一组也最多只有一个未结束批次。
@@ -205,7 +298,11 @@ python3 -m pytest tests/ -q
 测试覆盖：2～8 台约束、目标必须整组覆盖、开批互斥、幂等重放、改报冲突、
 failed 版本不动、全 ready 原子生效、结束后迟到回执拒收，以及多线程并发下
 "只可能有一个 open 批"、"失败时绝不部分切换"、"并发读到的版本集合只能是
-全旧或全新"等串行化不变量。
+全旧或全新"等串行化不变量；另覆盖设备组间调配的成功搬迁（版本随设备走）、
+空名单/重复 ID/同组/设备不在来源组/目标组同 ID/调配后超界/任一组有 open
+批次等拒绝分支的原子性，已结束批次归属与重放不受调配影响、新批次按新名单
+覆盖整组，以及"调配 vs 开批"、"调配 vs 末张回执"、对向调配并发下只可能
+等价于某个串行顺序。
 
 ## 项目结构
 

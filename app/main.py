@@ -10,7 +10,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, status
 
 from . import db, services
-from .schemas import CreateBatchRequest, CreateGroupRequest, ReceiptRequest
+from .schemas import (
+    CreateBatchRequest,
+    CreateGroupRequest,
+    ReceiptRequest,
+    TransferDevicesRequest,
+)
 
 
 @asynccontextmanager
@@ -49,6 +54,20 @@ def list_groups() -> list[dict]:
 def get_group(group_id: str) -> dict:
     """查询设备组及其当前版本（每台设备一行）。"""
     return services.get_group(group_id)
+
+
+@app.post("/groups/transfers")
+def transfer_devices(request: TransferDevicesRequest) -> dict:
+    """把一批设备连同当前版本从来源组调到目标组，返回调配后的两组。
+
+    任何前置条件不满足都整体回滚（设备不在来源组、目标组已有同 ID、
+    调配后任一组少于 2 台或多于 8 台、任一组存在未结束批次）。
+    """
+    return services.transfer_devices(
+        source_group_id=request.source_group_id,
+        target_group_id=request.target_group_id,
+        device_ids=request.device_ids,
+    )
 
 
 # ------------------------- 批次 ------------------------- #
